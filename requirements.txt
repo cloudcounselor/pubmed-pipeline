@@ -1,0 +1,5 @@
+boto3>=1.30.0
+psycopg[binary]>=3.1.0
+langchain-anthropic>=0.1.0
+langgraph>=0.0.15
+pydantic>=2.0.0
