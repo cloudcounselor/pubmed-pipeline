@@ -1,5 +1,10 @@
 """
 s3_chunk_scanner_pmcaws.py
+Dave Carre  08/15/2026
+** PMC announced a major change to its article-distribution system targeted for August 26, 2026. 
+Legacy dataset files were removed, so code based on older PMC directory structures must be deprecated.
+The current code is a fully up-to-date, alternative solution that accommodates the 
+new PMC Dataset inventory, structure, formats, and naming conventions. ** 
 
 Search PMC for articles mentioning strain aliases, then fetch the matching
 article-version XML objects from the public pmc-oa-opendata S3 bucket.
