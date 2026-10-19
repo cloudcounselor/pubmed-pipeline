@@ -1,5 +1,5 @@
 """
-s3_chunk_scanner_pmcaws.py
+s3_chunk_scanner_gpt.py
 Dave Carre  08/16/2026
 ** PMC announced a major change to its article-distribution system targeted for August 26, 2026. 
 Legacy dataset files were removed, so code based on older PMC directory structures must be deprecated.
@@ -30,6 +30,7 @@ Environment:
 import argparse
 import json
 import logging
+from datetime import datetime
 import os
 import re
 import time
@@ -53,7 +54,7 @@ DEFAULT_END_DATE = "2026/10/31"
 DEFAULT_CONTEXT_WINDOW = 500
 DEFAULT_MAX_ARTICLES = 2000
 DEFAULT_MAX_HITS = 2000
-DEFAULT_OUTPUT = "publication_mentions.jsonl"
+DEFAULT_OUTPUT = "publications_mentions.jsonl"
 USER_AGENT = "PMC-StrainMentionScanner/1.0 (research; contact repository administrator)"
 
 # Keep progress and errors visible without printing full article contents.
@@ -62,6 +63,33 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("pmc_scanner")
+
+
+# Give every execution a shared timestamp so its JSONL results and log are easy to pair.
+def build_run_paths(output_arg: str, run_timestamp: str) -> tuple[Path, Path]:
+    """Return timestamped JSONL and log paths in their dedicated subdirectories."""
+    script_dir = Path(__file__).resolve().parent
+    output_dir = script_dir / "output"
+    logs_dir = script_dir / "logs"
+
+    # Keep the requested base filename, but route all result files to /output.
+    requested_output = Path(output_arg).expanduser()
+    output_name = requested_output.name
+    output_suffix = requested_output.suffix or ".jsonl"
+    output_stem = requested_output.stem if requested_output.suffix else output_name
+    stamped_output = output_dir / f"{output_stem}_{run_timestamp}{output_suffix}"
+    log_path = logs_dir / f"s3_chunk_scanner_{run_timestamp}.log"
+    return stamped_output, log_path
+
+
+# Add a file handler for this run while retaining the existing console logging.
+def configure_run_file_logging(log_path: Path) -> None:
+    """Write the same timestamped progress messages to a per-run log file."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(file_handler)
 
 
 # Read the CSV and build one record per JAX ID, including searchable aliases.
@@ -449,7 +477,6 @@ def resolve_csv_path(cli_path: str | None) -> Path:
 
     here = Path(__file__).resolve().parent
     candidates = [here / "strains_abridged.csv", here / "Strains.csv", here.parent / "strains_abridged.csv"]
-#   orig:  candidates = [here / "strains_abridged.csv", here.parent / "strains_abridged.csv"]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -469,9 +496,16 @@ def main() -> int:
     parser.add_argument("--max-articles", type=int, default=DEFAULT_MAX_ARTICLES)
     parser.add_argument("--max-hits", type=int, default=DEFAULT_MAX_HITS)
     parser.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW)
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="JSONL output path when database connection is not configured")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Base JSONL filename; a unique run timestamp is appended")
     parser.add_argument("--dry-run", action="store_true", help="Discover candidate PMCID values and S3 keys but do not fetch XML or write hits")
     args = parser.parse_args()
+
+    # Create a high-resolution run ID; JSONL and log files share this exact suffix.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_path, log_path = build_run_paths(args.output, run_timestamp)
+    configure_run_file_logging(log_path)
+    log.info("Run ID: %s", run_timestamp)
+    log.info("Run log: %s", log_path)
 
     if args.max_articles < 1 or args.max_hits < 1:
         parser.error("--max-articles and --max-hits must be positive")
@@ -525,7 +559,6 @@ def main() -> int:
 
     log.info("Discovered %d unique candidate PMCIDs", len(candidate_ids))
     conn_string = os.getenv("PMC_DB_CONN_STRING")
-    output_path = Path(args.output).expanduser().resolve()
     total_articles = 0
     total_hits = 0
     processed_keys = set()
