@@ -25,6 +25,18 @@ built from Mouse Genome Informatics (MGI) data according to the plan in
 
 ## 2. Contents
 
+Highlighting the key coding modules:
+1) s3_chunk_scanner_gpt.py     > Searches PubMed Central for articles mentioning strain aliases from a CSV, automatically partitions oversized date ranges, and retrieves matching article XML from the public PMC AWS S3 repository. Extracts bibliographic metadata and contextual strain mentions, then records the results in timestamped JSONL output files or an optional PostgreSQL database, with run-specific logs and completeness checks.
+2) postgres_schema.py     > This script uses psycopg (v3) to create a highly optimized database schema. It features proper indexing, foreign keys, constraints to prevent duplicate entries, and a status tracking column to manage weekly batch workflows.
+3) db_init_extended.py    > Optional. Preloads or refreshes catalog entries before a scan.  This script remains useful as a deployment and administration entry point. It delegates all DDL to postgres_schema.py, which remains the single source of truth for the database schema. You do not need to run both scripts to initialize the database: use the initializer or run the schema script directly.
+4) langgraph_orchestrator.py
+5) pipeline_coordinator.py
+6) DockerFile
+7) docker-compose.yml
+8) test_pipeline.py
+9) Streamlit_Dashboard.py
+10) human_review_handler.py
+
 ```
 JAX_Mouse_Strain_Reference/
 ├── README.md                          this file
