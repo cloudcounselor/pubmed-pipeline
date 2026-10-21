@@ -22,16 +22,26 @@ under keys such as:
 This script intentionally does NOT crawl the entire S3 bucket and does NOT
 assume the legacy .xml.gz layout.
 
-Environment:
-  PMC_DB_CONN_STRING  Optional PostgreSQL connection string. If unset, hits
-                      are written to a local JSONL file instead.
-  PMC_CSV_PATH        Optional CSV path (default: strains_abridged.csv beside
-                      this script, then one directory above).
+Destinations:
+  --destinations both      Write to PostgreSQL AND JSONL (default; recommended).
+  --destinations postgres  Write only to PostgreSQL.
+  --destinations jsonl     Write only to JSONL.
+  PMC_OUTPUT_DESTINATIONS  Environment fallback for --destinations.
+  PMC_DB_CONN_STRING       PostgreSQL connection string; required when the
+                           selected destinations include PostgreSQL.
+  PMC_CSV_PATH             Optional CSV path (default: strains_abridged.csv
+                           beside this script, then one directory above).
+
+PostgreSQL is the primary analytical store. In the default "both" mode, each
+batch is attempted independently against PostgreSQL and JSONL: a database error
+is logged but does not suppress the redundant JSONL write. The run exits with a
+non-zero status if a requested destination fails, so a partial run is visible.
 """
 
 # Standard-library modules handle command-line options, JSONL output, logging,
 # regular expressions, timing, XML parsing, paths, and type hints.
 import argparse
+import hashlib
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -99,40 +109,52 @@ def configure_run_file_logging(log_path: Path) -> None:
 
 # Read the CSV and build one record per JAX ID, including searchable aliases.
 def load_strains(csv_path: Path) -> list[dict]:
-    """Load strain rows and collect usable aliases while preserving JAX IDs."""
+    """Load CSV aliases and one named catalog record per unique JAX ID."""
     df = pd.read_csv(csv_path, dtype=str).fillna("")
     if "jax_id" not in df.columns:
         raise ValueError(f"{csv_path} must contain a 'jax_id' column")
 
     alias_columns = [
-        "jax_id",
-        "rrid",
-        "official_strain_name",
-        "jax_strain_name",
-        "common_name",
+        "jax_id", "rrid", "product_name", "official_strain_name",
+        "jax_strain_name", "common_name",
     ]
     available = [c for c in alias_columns if c in df.columns]
-    strains = []
+    name_columns = ("product_name", "official_strain_name", "jax_strain_name", "common_name")
+    invalid_names = {"nan", "none", "not applicable", "not specified"}
+    by_jax_id: dict[str, dict] = {}
+
     for _, row in df.iterrows():
-        jax_id = row.get("jax_id", "").strip()
+        jax_id = str(row.get("jax_id", "")).strip()
         if not jax_id:
             continue
 
-        aliases = []
+        # Merge repeated CSV rows for the same JAX ID. This is important because
+        # PostgreSQL cannot update the same ON CONFLICT target twice in one
+        # executemany statement; aliases are merged while the catalog row stays unique.
+        strain = by_jax_id.setdefault(jax_id, {
+            "jax_id": jax_id, "aliases": [], "product_name": "",
+            "official_strain_name": "",
+        })
         for col in available:
             value = str(row.get(col, "")).strip()
-            if not value or value.lower() in {"nan", "none", "not applicable", "not specified"}:
+            if not value or value.lower() in invalid_names:
                 continue
-            # Ignore placeholder values, but keep meaningful names and identifiers.
-            if value not in aliases:
-                aliases.append(value)
+            if value not in strain["aliases"]:
+                strain["aliases"].append(value)
 
-        strains.append({
-            "jax_id": jax_id,
-            "aliases": aliases,
-            "official_strain_name": row.get("official_strain_name", "").strip(),
-        })
+        # Populate product_name from the best available human-readable CSV field.
+        # If the same JAX ID appears more than once, retain the first useful name.
+        if not strain["product_name"]:
+            strain["product_name"] = next(
+                (str(row.get(col, "")).strip() for col in name_columns
+                 if str(row.get(col, "")).strip()
+                 and str(row.get(col, "")).strip().lower() not in invalid_names),
+                "",
+            )
+        if not strain["official_strain_name"]:
+            strain["official_strain_name"] = str(row.get("official_strain_name", "")).strip()
 
+    strains = list(by_jax_id.values())
     if not strains:
         raise ValueError(f"No usable JAX IDs were found in {csv_path}")
     return strains
@@ -541,6 +563,8 @@ def find_alias_mentions(
                 hits.append({
                     "jax_id": strain["jax_id"],
                     "s3_uri": s3_uri,
+                    "pmcid": article_metadata.get("pmcid", ""),
+                    "article_version": article_metadata.get("article_version", ""),
                     "publication_title": article_metadata.get("title", ""),
                     "author": article_metadata.get("author", ""),
                     "publication_name": article_metadata.get("publication_name", ""),
@@ -572,7 +596,17 @@ def fetch_and_scan_xml(
     article_metadata = extract_article_metadata(xml_bytes)
     full_text = flatten_xml(xml_bytes)
 
-    # Pass the extracted metadata into the matching function with the article's S3 URI.
+    # Extract stable article/version identifiers from the repository object key.
+    # Expected key shape: PMC<PMCID>.<version>/PMC<PMCID>.<version>.xml
+    match = re.search(r"(?:^|/)PMC(\d+)\.(\d+)/PMC\d+\.\d+\.xml$", key)
+    if match:
+        article_metadata["pmcid"] = match.group(1)
+        article_metadata["article_version"] = match.group(2)
+    else:
+        article_metadata["pmcid"] = ""
+        article_metadata["article_version"] = ""
+
+    # Pass extracted metadata and the canonical S3 URI into deterministic matching.
     return find_alias_mentions(
         full_text,
         strains,
@@ -594,38 +628,86 @@ def write_jsonl(hits: Iterable[dict], output_path: Path) -> int:
     return count
 
 
-# Optional database sink; this existing insert remains unchanged by metadata changes.
-def insert_mentions_to_db(hits: list[dict], conn_string: str) -> None:
-    """Insert hits into the existing publication_mentions table."""
-    if not hits:
-        return
+# PostgreSQL destination helpers. The schema itself must be provisioned once by
+# postgres_schema.py or db_init_extended.py; this scanner intentionally does not run
+# DDL at runtime. Catalog rows are different: the scanner upserts them automatically
+# from the same CSV used for matching, so a separate CSV-seeding step is NOT required.
+def upsert_strain_catalog(strains: list[dict], conn_string: str) -> None:
+    """Ensure every JAX FK parent exists and has a useful product_name when available."""
     try:
         import psycopg
     except ImportError as exc:
-        raise RuntimeError("Install psycopg to write to PostgreSQL, or unset PMC_DB_CONN_STRING.") from exc
+        raise RuntimeError("PostgreSQL output requires psycopg v3 (pip install 'psycopg[binary]').") from exc
 
     query = """
-        INSERT INTO publication_mentions (
-            jax_id, s3_uri, matched_text, context_window, pipeline_status
-        )
-        VALUES (%s, %s, %s, %s, 'PENDING_LLM')
-        ON CONFLICT DO NOTHING;
+        INSERT INTO jax_products (jax_id, product_name)
+        VALUES (%s, %s)
+        ON CONFLICT (jax_id) DO UPDATE
+          SET product_name = COALESCE(NULLIF(EXCLUDED.product_name, ''), jax_products.product_name);
     """
     with psycopg.connect(conn_string) as conn:
         with conn.cursor() as cur:
-            cur.executemany(
-                query,
-                [
-                    (
-                        hit["jax_id"],
-                        hit["s3_uri"],
-                        hit["matched_text"],
-                        hit["context_window"],
-                    )
-                    for hit in hits
-                ],
-            )
-        conn.commit()
+            cur.executemany(query, [
+                (row["jax_id"], row.get("product_name") or row.get("official_strain_name", ""))
+                for row in strains
+            ])
+
+
+def _mention_fingerprint(hit: dict) -> str:
+    """Stable idempotency key for the same strain/alias/article/context match."""
+    identity = "\x1f".join(str(hit.get(field, "")) for field in (
+        "jax_id", "s3_uri", "matched_alias", "matched_text", "context_window"
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def insert_mentions_to_db(hits: list[dict], conn_string: str) -> int:
+    """Idempotently upsert extracted mention data without overwriting AI review fields."""
+    if not hits:
+        return 0
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError("PostgreSQL output requires psycopg v3 (pip install 'psycopg[binary]').") from exc
+
+    query = """
+        INSERT INTO publication_mentions (
+            mention_fingerprint, jax_id, s3_uri, pmcid, article_version,
+            publication_title, author, publication_name, publication_date,
+            matched_text, matched_alias, context_window, pipeline_status, extracted_at
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            'PENDING_LLM', CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (mention_fingerprint) DO UPDATE SET
+            pmcid = EXCLUDED.pmcid,
+            article_version = EXCLUDED.article_version,
+            publication_title = EXCLUDED.publication_title,
+            author = EXCLUDED.author,
+            publication_name = EXCLUDED.publication_name,
+            publication_date = EXCLUDED.publication_date,
+            matched_text = EXCLUDED.matched_text,
+            matched_alias = EXCLUDED.matched_alias,
+            context_window = EXCLUDED.context_window,
+            extracted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP;
+        -- Classification/review fields are deliberately not overwritten on reruns.
+    """
+    rows = []
+    for hit in hits:
+        rows.append((
+            _mention_fingerprint(hit), hit["jax_id"], hit["s3_uri"],
+            hit.get("pmcid") or None, hit.get("article_version") or None,
+            hit.get("publication_title", ""), hit.get("author", ""),
+            hit.get("publication_name", ""), hit.get("publication_date", ""),
+            hit["matched_text"], hit.get("matched_alias", hit["matched_text"]),
+            hit["context_window"],
+        ))
+    with psycopg.connect(conn_string) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(query, rows)
+    return len(rows)
 
 
 # Resolve the CSV path from a command-line argument, environment variable, or defaults.
@@ -658,6 +740,15 @@ def main() -> int:
     parser.add_argument("--max-hits", type=int, default=DEFAULT_MAX_HITS)
     parser.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW)
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Base JSONL filename; a unique run timestamp is appended")
+    # Destination control: CLI overrides PMC_OUTPUT_DESTINATIONS; default is BOTH.
+    # "both" is recommended: PostgreSQL is primary and JSONL is the redundant copy.
+    parser.add_argument(
+        "--destinations",
+        choices=("both", "postgres", "jsonl"),
+        default=os.getenv("PMC_OUTPUT_DESTINATIONS", "both").strip().lower(),
+        help=("Where to persist hits: both (default), postgres, or jsonl. "
+              "The postgres option requires PMC_DB_CONN_STRING."),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discover candidate PMCID values and S3 keys but do not fetch XML or write hits")
     args = parser.parse_args()
 
@@ -671,9 +762,34 @@ def main() -> int:
     if args.max_articles < 1 or args.max_hits < 1:
         parser.error("--max-articles and --max-hits must be positive")
 
+    # Validate sink configuration before making expensive API/S3 calls.
+    conn_string = os.getenv("PMC_DB_CONN_STRING")
+    write_postgres = args.destinations in {"both", "postgres"}
+    write_jsonl_enabled = args.destinations in {"both", "jsonl"}
+    if write_postgres and not conn_string:
+        parser.error(
+            f"--destinations {args.destinations} requires PMC_DB_CONN_STRING. "
+            "Set it, or explicitly choose --destinations jsonl."
+        )
+
+    log.info(
+        "Output destinations: %s | PostgreSQL=%s | JSONL=%s",
+        args.destinations, "ENABLED" if write_postgres else "DISABLED",
+        "ENABLED" if write_jsonl_enabled else "DISABLED",
+    )
+
     # Load the input strain catalogue and create the alias list used for discovery.
     csv_path = resolve_csv_path(args.csv)
     strains = load_strains(csv_path)
+    if write_postgres and not args.dry_run:
+        # Populate the FK parent table from the same CSV used for matching, avoiding
+        # a failure when a valid JAX ID has not previously been seeded in PostgreSQL.
+        try:
+            upsert_strain_catalog(strains, conn_string)
+            log.info("Ensured %d JAX IDs are present in jax_products.", len(strains))
+        except Exception as exc:
+            log.error("Could not prepare PostgreSQL strain catalog: %s", exc)
+            return 2
     search_terms = make_search_terms(strains)
     log.info("Loaded %d strain rows and %d unique row/alias search terms from %s",
              len(strains), len(search_terms), csv_path)
@@ -744,9 +860,9 @@ def main() -> int:
         "search_terms_attempted=%d",
         f"{len(candidate_ids):,}", len(search_terms),
     )
-    conn_string = os.getenv("PMC_DB_CONN_STRING")
     total_articles = 0
     total_hits = 0
+    destination_failures = 0
     processed_keys = set()
 
     # Resolve each unique PMCID to versioned XML keys and process within configured limits.
@@ -789,20 +905,27 @@ def main() -> int:
             if hits:
                 remaining = args.max_hits - total_hits
                 hits = hits[:remaining]
-                # Persist only actual matches, respecting the global hit limit.
             if hits:
-                    if conn_string:
-                        try:
-                            insert_mentions_to_db(hits, conn_string)
-                        except Exception as exc:
-                            log.error("Database insert failed; writing these hits to JSONL instead: %s", exc)
-                            write_jsonl(hits, output_path)
-                    else:
-                        write_jsonl(hits, output_path)
+                # Each enabled destination is attempted independently. In "both"
+                # mode, a PostgreSQL failure must NOT prevent the JSONL backup.
+                if write_postgres:
+                    try:
+                        inserted = insert_mentions_to_db(hits, conn_string)
+                        log.info("PostgreSQL upsert attempted for %d mention rows.", inserted)
+                    except Exception as exc:
+                        destination_failures += 1
+                        log.exception("PostgreSQL write failed for %s: %s", key, exc)
+                if write_jsonl_enabled:
+                    try:
+                        written = write_jsonl(hits, output_path)
+                        log.info("JSONL wrote %d mention rows to %s", written, output_path)
+                    except Exception as exc:
+                        destination_failures += 1
+                        log.exception("JSONL write failed for %s: %s", key, exc)
 
-                    total_hits += len(hits)
-                    log.info("HITS: %d in %s (cumulative hits: %d)",
-                             len(hits), key, total_hits)
+                total_hits += len(hits)
+                log.info("HITS: %d in %s (cumulative hits scanned: %d)",
+                         len(hits), key, total_hits)
 
             if total_hits >= args.max_hits:
                 log.warning("Reached --max-hits limit (%d); stopping.", args.max_hits)
@@ -811,11 +934,15 @@ def main() -> int:
         if total_hits >= args.max_hits:
             break
 
-    # Summarize the run and identify the JSONL destination when used.
-    log.info("Finished. XML objects fetched/scanned: %d; hits recorded: %d", total_articles, total_hits)
-    if not conn_string and not args.dry_run:
-        log.info("Hit output: %s", output_path)
-    return 0
+    # Summarize each sink explicitly. A non-zero exit means one or more requested
+    # destinations failed; inspect the run log and use the successful sink for recovery.
+    log.info("Finished. XML objects fetched/scanned: %d; hits scanned: %d; destination failures: %d",
+             total_articles, total_hits, destination_failures)
+    if write_postgres:
+        log.info("PostgreSQL destination: ENABLED (primary store)")
+    if write_jsonl_enabled and not args.dry_run:
+        log.info("JSONL destination: %s", output_path)
+    return 1 if destination_failures else 0
 
 
 if __name__ == "__main__":
