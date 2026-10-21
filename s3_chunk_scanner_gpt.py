@@ -1,10 +1,14 @@
 """
 s3_chunk_scanner_gpt.py
-Dave Carre  08/16/2026
+Dave Carre  08/20/2026
+
 ** PMC announced a major change to its article-distribution system targeted for August 26, 2026. 
 Legacy dataset files were removed, so code based on older PMC directory structures must be deprecated.
 The current code is a fully up-to-date, alternative solution that accommodates the 
 new PMC Dataset inventory, structure, formats, and naming conventions. ** 
+Search PMC for articles mentioning strain aliases, fetch matching article-version
+XML objects from the public pmc-oa-opendata S3 bucket, and capture bibliographic
+metadata alongside every detected mention.
 
 Search PMC for articles mentioning strain aliases, fetch matching article-version
 XML objects from the public pmc-oa-opendata S3 bucket, and capture bibliographic
@@ -30,7 +34,7 @@ Environment:
 import argparse
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import os
 import re
 import time
@@ -55,6 +59,7 @@ DEFAULT_CONTEXT_WINDOW = 500
 DEFAULT_MAX_ARTICLES = 2000
 DEFAULT_MAX_HITS = 2000
 DEFAULT_OUTPUT = "publications_mentions.jsonl"
+ESEARCH_RESULT_CAP = 10000
 USER_AGENT = "PMC-StrainMentionScanner/1.0 (research; contact repository administrator)"
 
 # Keep progress and errors visible without printing full article contents.
@@ -169,8 +174,9 @@ def esearch_pmc_ids(
     *,
     api_key: str | None = None,
     pause_seconds: float = 0.36,
+    expected_count: int | None = None,
 ) -> list[str]:
-    """Query PMC ESearch and return numeric PMCID suffixes, with explicit cap checks."""
+    """Query PMC ESearch and return numeric PMCID suffixes with completeness checks."""
     params = {
         "db": "pmc",
         "term": query,
@@ -191,14 +197,169 @@ def esearch_pmc_ids(
         raise RuntimeError(f"ESearch error for query {query!r}: {result['error']}")
 
     count = int(result.get("count", "0"))
-    ids = result.get("idlist", [])
-    if count > 10000:
+    ids = [str(value) for value in result.get("idlist", [])]
+    if count > ESEARCH_RESULT_CAP:
         raise RuntimeError(
-            f"ESearch query returned {count:,} records, exceeding its 10,000-result cap. "
-            "Split the date range into smaller intervals for this alias."
+            f"ESearch ID request reports {count:,} matching records, exceeding the "
+            f"{ESEARCH_RESULT_CAP:,}-result cap. Refusing potentially truncated results."
         )
+    if expected_count is not None and count != expected_count:
+        raise RuntimeError(
+            f"ESearch count changed between preflight and ID retrieval: "
+            f"preflight={expected_count:,}, retrieval response={count:,}. "
+            "Refusing to treat this interval as complete; retry the run."
+        )
+    if len(ids) != count:
+        raise RuntimeError(
+            f"ESearch completeness check failed: API count={count:,}, "
+            f"IDs returned={len(ids):,}. Refusing to use an incomplete ID list."
+        )
+    invalid_ids = [value for value in ids if not value.isdigit()]
+    if invalid_ids:
+        raise RuntimeError(f"ESearch returned non-numeric PMC identifiers: {invalid_ids[:3]!r}")
     time.sleep(pause_seconds)
-    return [str(value) for value in ids]
+    return ids
+
+
+def esearch_result_count(
+    session: requests.Session,
+    query: str,
+    *,
+    api_key: str | None = None,
+    pause_seconds: float = 0.36,
+) -> int:
+    """Ask ESearch for the count only, before requesting any result IDs."""
+    params = {
+        "db": "pmc",
+        "term": query,
+        "retmode": "json",
+        "retmax": "0",
+        "tool": "pmc_strain_mention_scanner",
+    }
+    if api_key:
+        params["api_key"] = api_key
+
+    response = session.get(ESEARCH_URL, params=params, timeout=(15, 90))
+    response.raise_for_status()
+    result = response.json().get("esearchresult", {})
+    if result.get("error"):
+        raise RuntimeError(f"ESearch error for query {query!r}: {result['error']}")
+    count = int(result.get("count", "0"))
+    time.sleep(pause_seconds)
+    return count
+
+
+def discover_pmc_ids_within_cap(
+    session: requests.Session,
+    alias: str,
+    start_date: str,
+    end_date: str,
+    *,
+    api_key: str | None = None,
+) -> list[str]:
+    """Partition a date range until each ESearch result set is within the API cap.
+
+    Each accepted interval is preflight-counted immediately before ID retrieval.
+    The returned list is deduplicated across intervals; a partition summary is
+    logged so interval totals are not confused with unique PMCID totals.
+    """
+    start = date.fromisoformat(start_date.replace("/", "-"))
+    end = date.fromisoformat(end_date.replace("/", "-"))
+    if start > end:
+        raise ValueError(f"Start date {start_date} is after end date {end_date}")
+
+    discovered: set[str] = set()
+    pending: list[tuple[date, date]] = [(start, end)]
+    accepted_intervals: list[tuple[str, str, int, int]] = []
+    split_count = 0
+    expected_total = 0
+    returned_total = 0
+    duplicate_ids_across_intervals = 0
+    initial_count: int | None = None
+
+    while pending:
+        interval_start, interval_end = pending.pop(0)
+        start_text = interval_start.strftime("%Y/%m/%d")
+        end_text = interval_end.strftime("%Y/%m/%d")
+        query = build_esearch_query(alias, start_text, end_text)
+        count = esearch_result_count(session, query, api_key=api_key)
+        if initial_count is None:
+            initial_count = count
+        log.info(
+            "ESearch preflight | alias=%r | interval=%s..%s | matching_records=%s | cap=%s",
+            alias, start_text, end_text, f"{count:,}", f"{ESEARCH_RESULT_CAP:,}",
+        )
+
+        if count > ESEARCH_RESULT_CAP:
+            if interval_start == interval_end:
+                raise RuntimeError(
+                    f"A single-day ESearch interval for alias {alias!r} ({start_text}) "
+                    f"still returns {count:,} records, above the {ESEARCH_RESULT_CAP:,}-result "
+                    "cap; automatic date splitting cannot reduce this interval further."
+                )
+            midpoint = interval_start + (interval_end - interval_start) // 2
+            right_start = midpoint + timedelta(days=1)
+            split_count += 1
+            pending[0:0] = [(interval_start, midpoint), (right_start, interval_end)]
+            log.info(
+                "ESearch partition split | alias=%r | oversized_interval=%s..%s | "
+                "split_after=%s | left=%s..%s | right=%s..%s",
+                alias, start_text, end_text, midpoint.strftime("%Y/%m/%d"),
+                start_text, midpoint.strftime("%Y/%m/%d"),
+                right_start.strftime("%Y/%m/%d"), end_text,
+            )
+            continue
+
+        # Safety gate: never make an ID request for an interval whose preflight
+        # count exceeds the API cap. Kept at the call site as a second guard.
+        if count > ESEARCH_RESULT_CAP:
+            raise RuntimeError(
+                f"Safety gate blocked ID retrieval for {alias!r} {start_text}..{end_text}: "
+                f"preflight count {count:,} exceeds cap {ESEARCH_RESULT_CAP:,}."
+            )
+        if count == 0:
+            accepted_intervals.append((start_text, end_text, count, 0))
+            continue
+
+        ids = esearch_pmc_ids(
+            session, query, api_key=api_key, expected_count=count
+        )
+        if len(ids) > ESEARCH_RESULT_CAP:
+            raise RuntimeError(
+                f"Safety gate failed for {alias!r} {start_text}..{end_text}: "
+                f"retrieved {len(ids):,} IDs, above cap {ESEARCH_RESULT_CAP:,}."
+            )
+        before = len(discovered)
+        discovered.update(ids)
+        newly_added = len(discovered) - before
+        duplicates_here = len(ids) - newly_added
+        duplicate_ids_across_intervals += duplicates_here
+        expected_total += count
+        returned_total += len(ids)
+        accepted_intervals.append((start_text, end_text, count, len(ids)))
+        log.info(
+            "ESearch interval accepted | alias=%r | interval=%s..%s | "
+            "preflight_count=%s | ids_retrieved=%s | new_unique_ids=%s | "
+            "overlap_duplicates=%s",
+            alias, start_text, end_text, f"{count:,}", f"{len(ids):,}",
+            f"{newly_added:,}", f"{duplicates_here:,}",
+        )
+
+    interval_summary = "; ".join(
+        f"{left}..{right}: count={count:,}, ids={got:,}"
+        for left, right, count, got in accepted_intervals
+    ) or "none"
+    log.info(
+        "ESearch partition summary | alias=%r | requested_window=%s..%s | "
+        "initial_preflight_count=%s | splits=%d | accepted_intervals=%d | "
+        "sum_of_accepted_interval_counts=%s | total_ids_retrieved=%s | "
+        "unique_pmcids=%s | duplicate_ids_across_intervals=%s | intervals=[%s]",
+        alias, start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d"),
+        f"{(initial_count or 0):,}", split_count, len(accepted_intervals),
+        f"{expected_total:,}", f"{returned_total:,}", f"{len(discovered):,}",
+        f"{duplicate_ids_across_intervals:,}", interval_summary,
+    )
+    return sorted(discovered, key=int)
 
 
 # Resolve a PMCID to the actual version-specific XML keys present in public S3.
@@ -538,9 +699,27 @@ def main() -> int:
     candidate_ids = set()
     id_to_search_terms: dict[str, set[str]] = {}
     for index, (jax_id, alias) in enumerate(search_terms, start=1):
-        query = build_esearch_query(alias, start_date, end_date)
         try:
-            ids = esearch_pmc_ids(session, query, api_key=api_key)
+            if start_date and end_date:
+                # Treat the requested dates as the outer search window. Preflight
+                # counts and subdivide oversized intervals before fetching IDs.
+                ids = discover_pmc_ids_within_cap(
+                    session, alias, start_date, end_date, api_key=api_key
+                )
+            else:
+                # --no-date-filter is an explicit request not to partition by date.
+                # If it exceeds the API cap, the existing guard fails safely.
+                query = build_esearch_query(alias, start_date, end_date)
+                count = esearch_result_count(session, query, api_key=api_key)
+                if count > ESEARCH_RESULT_CAP:
+                    raise RuntimeError(
+                        f"Unbounded ESearch query for alias {alias!r} returned "
+                        f"{count:,} records, exceeding the {ESEARCH_RESULT_CAP:,}-result cap. "
+                        "Run with a start/end date range to enable automatic splitting."
+                    )
+                ids = esearch_pmc_ids(
+                    session, query, api_key=api_key, expected_count=count
+                ) if count else []
         except Exception as exc:
             log.error("ESearch failed for alias %r (JAX ID %s): %s", alias, jax_id, exc)
             continue
@@ -549,15 +728,22 @@ def main() -> int:
             candidate_ids.add(pmcid)
             id_to_search_terms.setdefault(pmcid, set()).add(alias)
 
-        log.info("Search term %d/%d: %r -> %d PMCID(s); %d unique candidates so far",
-                 index, len(search_terms), alias, len(ids), len(candidate_ids))
+        log.info(
+            "Search term %d/%d | alias=%r | pmcids_for_this_alias=%s | "
+            "cumulative_unique_pmcids_across_all_aliases=%s",
+            index, len(search_terms), alias, f"{len(ids):,}", f"{len(candidate_ids):,}",
+        )
 
     # Stop early if discovery produced no IDs; there is nothing to fetch in this run.
     if not candidate_ids:
         log.warning("ESearch returned no candidate articles. Verify query syntax and date range.")
         return 0
 
-    log.info("Discovered %d unique candidate PMCIDs", len(candidate_ids))
+    log.info(
+        "Discovery complete | cumulative_unique_pmcids_across_all_aliases=%s | "
+        "search_terms_attempted=%d",
+        f"{len(candidate_ids):,}", len(search_terms),
+    )
     conn_string = os.getenv("PMC_DB_CONN_STRING")
     total_articles = 0
     total_hits = 0
