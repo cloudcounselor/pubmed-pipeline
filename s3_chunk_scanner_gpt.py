@@ -1,26 +1,23 @@
 """
 s3_chunk_scanner_gpt.py
-Dave Carre  08/20/2026
+Dave Carre  08/21/2026
+
+Project Purpose:
+Search PMC for articles mentioning strain aliases, fetch matching article-version
+XML objects from the public pmc-oa-opendata S3 bucket, and capture bibliographic
+metadata alongside every detected mention.
 
 ** PMC announced a major change to its article-distribution system targeted for August 26, 2026. 
 Legacy dataset files were removed, so code based on older PMC directory structures must be deprecated.
 The current code is a fully up-to-date, alternative solution that accommodates the 
 new PMC Dataset inventory, structure, formats, and naming conventions. ** 
-Search PMC for articles mentioning strain aliases, fetch matching article-version
-XML objects from the public pmc-oa-opendata S3 bucket, and capture bibliographic
-metadata alongside every detected mention.
-
-Search PMC for articles mentioning strain aliases, fetch matching article-version
-XML objects from the public pmc-oa-opendata S3 bucket, and capture bibliographic
-metadata alongside every detected mention.
 
 Discovery follows PMC's documented eSearch -> PMCID -> S3 article-version
 prefix pipeline. The current PMC AWS structure uses uncompressed .xml objects
 under keys such as:
   PMC10009416.1/PMC10009416.1.xml
 
-This script intentionally does NOT crawl the entire S3 bucket and does NOT
-assume the legacy .xml.gz layout.
+This script intentionally does NOT crawl the entire S3 bucket and supercedes the legacy .xml.gz layout.
 
 Destinations:
   --destinations both      Write to PostgreSQL AND JSONL (default; recommended).
