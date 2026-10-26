@@ -3,7 +3,7 @@
 Launch from the project directory with:
     streamlit run Streamlit_Dashboard.py
 
-Requirements: streamlit, psycopg[binary], PostgreSQL schema already created,
+Requirements: streamlit, psycopg[binary], python-dotenv, PostgreSQL schema already created,
 PMC_DB_CONN_STRING set in the environment, and human_review_handler.py in the
 same directory. This UI delegates ALL writes to the transaction handler.
 """
@@ -60,7 +60,12 @@ def fetch_pending_items() -> list[dict]:
     """
     query = """
         SELECT mention_id, jax_id, s3_uri, matched_text, context_window,
-               confidence_score, ai_justification
+               confidence_score, ai_justification, product_status,
+               is_valid_jax_mention, matched_alias, normalized_term,
+               n_candidates_jax_set, n_candidates_all_mgi,
+               is_ambiguous_in_jax_set, ambiguity_metadata_quality,
+               candidate_identifiers, publication_title, author,
+               publication_name, publication_date, pmcid
           FROM publication_mentions
          WHERE pipeline_status = 'HUMAN_REVIEW'
          ORDER BY confidence_score ASC NULLS LAST, mention_id
@@ -142,6 +147,13 @@ if selected_id is not None:
             f'line-height:1.6">{formatted_snippet}</div>',
             unsafe_allow_html=True,
         )
+        # Citation metadata provides provenance for checking the underlying
+        # publication before the reviewer overrides the model classification.
+        st.write("**Publication:**", current_record["publication_title"] or "Not recorded")
+        st.write("**Author:**", current_record["author"] or "Not recorded")
+        st.write("**Journal:**", current_record["publication_name"] or "Not recorded")
+        st.write("**Publication date:**", current_record["publication_date"] or "Not recorded")
+        st.write("**PMCID:**", current_record["pmcid"] or "Not recorded")
         st.caption("S3 source URI")
         st.code(current_record["s3_uri"] or "Not available")
 
@@ -151,6 +163,18 @@ if selected_id is not None:
         st.write("**Matched text:**", current_record["matched_text"] or "Not available")
         score = current_record["confidence_score"]
         st.write("**Original AI confidence:**", "N/A" if score is None else f"{float(score):.3f}")
+        # These fields are defined by the canonical schema and supplied to the
+        # LangGraph evaluation. They explain WHY deterministic routing sent a
+        # record to review even when the model confidence is high.
+        st.write("**AI product classification:**", current_record["product_status"] or "Not recorded")
+        st.write("**AI valid-mention flag:**", current_record["is_valid_jax_mention"])
+        st.write("**Matched alias:**", current_record["matched_alias"] or "Not recorded")
+        st.write("**Normalized term:**", current_record["normalized_term"] or "Not recorded")
+        st.write("**JAX candidate count:**", current_record["n_candidates_jax_set"])
+        st.write("**MGI candidate count:**", current_record["n_candidates_all_mgi"])
+        st.write("**Ambiguous within JAX set:**", current_record["is_ambiguous_in_jax_set"])
+        st.write("**Catalog metadata quality:**", current_record["ambiguity_metadata_quality"] or "Unknown")
+        st.write("**Candidate identifiers:**", current_record["candidate_identifiers"] or [])
         st.write("**AI justification:**")
         st.info(current_record["ai_justification"] or "No justification was recorded.")
 
